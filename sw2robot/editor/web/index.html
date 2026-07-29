@@ -907,6 +907,11 @@ package:// URLs, meshes in the chosen format">
 package:// URLs, meshes in the chosen format, plus launch/display.launch.py + rviz
 config (run: ros2 launch <name>_description display.launch.py)">
             ⬇ ROS2 package</button></a>
+        <a id="expmujoco" href="/api/export/zip?target=mujoco" download>
+          <button data-i18n="ui.expmujoco" data-i18n-title="t.expmujoco"
+                  title="MuJoCo-oriented URDF package (<name>_mujoco by default):
+relative mesh refs, STL meshes, fixed links merged and origins baked by default">
+            ⬇ MuJoCo package</button></a>
       </div>
       <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-top:4px">
         <button id="redetectmimic" data-i18n="ui.redetectmimic"
@@ -1758,6 +1763,9 @@ the config and does NOT re-detect). Needs graph.json (CAD mode).">🔗 re-detect
     't.expros2': { en: 'portable ROS 2 (ament_cmake) package (<name>_description): package:// URLs, meshes in the chosen format, plus launch/display.launch.py + rviz config (run: ros2 launch <name>_description display.launch.py)',
                   ja: 'ポータブルな ROS 2 (ament_cmake) パッケージ (<name>_description): package:// URL、選択した形式のメッシュ、launch/display.launch.py + rviz 設定付き（実行: ros2 launch <name>_description display.launch.py）' },
     'ui.expros2': { en: '⬇ ROS2 package', ja: '⬇ ROS2 パッケージ' },
+    't.expmujoco': { en: 'MuJoCo-oriented URDF package (<name>_mujoco by default): relative mesh refs, STL meshes, fixed links merged and origins baked by default. Collision defaults to auto (CoACD when available, else hull), unless you choose another collision mode.',
+                  ja: 'MuJoCo 向け URDF パッケージ（既定は <name>_mujoco）: 相対メッシュ参照、STL メッシュ、fixed link 統合と origin bake を既定で適用。衝突形状は既定で auto（CoACD があればそれ、なければ凸包）で、別モードを選べます。' },
+    'ui.expmujoco': { en: '⬇ MuJoCo package', ja: '⬇ MuJoCo パッケージ' },
     'ui.collmode': { en: 'collision', ja: '衝突形状' },
     't.collmode': { en: "How <collision> geometry is produced for the ROS1/ROS2 packages: 'visual mesh' reuses the visual mesh as-is; 'convex hull' uses a single convex hull per link (simple, good for path planning); 'CoACD' decomposes each link into many convex parts (best for physics, slower — server needs the coacd package); 'primitive'/'box'/'cylinder'/'sphere' fit a native URDF primitive per link, no mesh file at all — the lightest collision ('primitive' auto-picks the best shape; server needs scikit-robot). Generate previews the result in the viewer.",
                     ja: 'ROS1/ROS2 パッケージの <collision> ジオメトリの生成方法: 「ビジュアルメッシュ」はメッシュをそのまま使用、「凸包」はリンクごとに単一の凸包（シンプル、経路計画向け）、「CoACD」は各リンクを多数の凸パーツに分解（物理向け・低速、サーバーに coacd パッケージが必要）、「プリミティブ／直方体／円柱／球」はリンクごとに URDF ネイティブのプリミティブをフィット（メッシュファイル無しで最軽量、「プリミティブ」は最適形状を自動選択、サーバーに scikit-robot が必要）。「生成」でビューアにプレビューします。' },
@@ -6544,13 +6552,14 @@ autolimitsBtn.addEventListener('click', async () => {
 });
 
 // ---- export names: thread the chosen package + URDF names into the ZIP links
-// the ROS1/ROS2/glb downloads are plain <a download> links; on click we rewrite
-// their ?name=&urdf= from these fields so the exported package (and zip) carry
-// them.  Empty URDF name -> the URDF inside is named after the package.
+// the ROS1/ROS2/MuJoCo downloads are plain <a download> links; on click we
+// rewrite their query from these fields so the exported package (and zip) carry
+// them.  Empty URDF name -> the URDF inside is named after the package or, for
+// MuJoCo, after the robot name.
 const exppkg = document.getElementById('exppkg');
 const expurdf = document.getElementById('expurdf');
 const expmeshdir = document.getElementById('expmeshdir');
-const expLinks = ['expdae', 'expros2']
+const expLinks = ['expdae', 'expros2', 'expmujoco']
   .map(id => document.getElementById(id)).filter(Boolean);
 const expVisFmt = document.getElementById('expvisfmt');
 const expColFmt = document.getElementById('expcolfmt');
@@ -6860,6 +6869,7 @@ expLinks.forEach(a => a.addEventListener('click', async ev => {
   ev.preventDefault();
   // mesh format is orthogonal to ROS version: the button picks the version,
   // the selectors pick visual + collision format independently
+  const target = a.id === 'expmujoco' ? 'mujoco' : 'ros';
   const ros = a.id === 'expros2' ? 2 : 1;
   const vfmt = expVisFmt?.value || 'dae';
   const cfmt = expColFmt?.value || 'stl';
@@ -6870,14 +6880,21 @@ expLinks.forEach(a => a.addEventListener('click', async ev => {
   // separate uniform-glb button is gone -- format is now a visual selector)
   const collMode = collModeSel?.value || 'copy';
   const mergeFixed = !!mergeFixedBox?.checked;
-  const query = `ros=${ros}&meshes=${vfmt}&colfmt=${cfmt}`
-    + (name ? `&name=${encodeURIComponent(name)}` : '')
-    + (urdf ? `&urdf=${encodeURIComponent(urdf)}` : '')
-    + (meshdir ? `&meshdir=${encodeURIComponent(meshdir)}` : '')
-    + (collMode !== 'copy' ? `&collision=${collMode}` : '')
-    + (collMode === 'coacd' ? `&cquality=${cqualitySel?.value || 'balanced'}` : '')
-    + (mergeFixed ? '&mergefixed=1' : '');
-  const what = ros === 2 ? 'ROS 2' : 'ROS 1';
+  const query = (target === 'mujoco'
+    ? `target=mujoco`
+      + (name ? `&name=${encodeURIComponent(name)}` : '')
+      + (urdf ? `&urdf=${encodeURIComponent(urdf)}` : '')
+      + (collMode !== 'copy' ? `&collision=${collMode}` : '')
+      + (collMode === 'coacd' ? `&cquality=${cqualitySel?.value || 'balanced'}` : '')
+      + (mergeFixed ? '&mergefixed=1' : '')
+    : `ros=${ros}&meshes=${vfmt}&colfmt=${cfmt}`
+      + (name ? `&name=${encodeURIComponent(name)}` : '')
+      + (urdf ? `&urdf=${encodeURIComponent(urdf)}` : '')
+      + (meshdir ? `&meshdir=${encodeURIComponent(meshdir)}` : '')
+      + (collMode !== 'copy' ? `&collision=${collMode}` : '')
+      + (collMode === 'coacd' ? `&cquality=${cqualitySel?.value || 'balanced'}` : '')
+      + (mergeFixed ? '&mergefixed=1' : ''));
+  const what = target === 'mujoco' ? 'MuJoCo' : (ros === 2 ? 'ROS 2' : 'ROS 1');
   showLoadbar(t('export.bar', { what }), { indet: true });
   log(t('export.start', { what }));
   try {

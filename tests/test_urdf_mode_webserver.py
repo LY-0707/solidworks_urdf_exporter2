@@ -927,6 +927,76 @@ def test_export_zip_stl_visual_emits_material(server):
     assert "<material" in exported and 'rgba="1 0 0 1"' in exported
 
 
+def test_export_zip_includes_export_report(server):
+    """Every ZIP export carries an export report sidecar for provenance."""
+    import io
+    import zipfile
+
+    code, data = _get_status(server, "/api/export/zip?ros=1&meshes=dae")
+    assert code == 200, data[:200]
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    names = zf.namelist()
+    report_name = next(n for n in names if n.endswith("/_sw2robot_export.json"))
+    report = json.loads(zf.read(report_name).decode("utf-8"))
+
+    assert report["backend"] == "ros_description"
+    assert report["backend_options"]["export_surface"] == "webserver_zip"
+
+
+def test_export_zip_runs_external_validator_when_configured(server, monkeypatch):
+    """When SW2ROBOT_VALIDATE_CMD is set, the ZIP also ships the validation
+    sidecar and the export report embeds the validator result."""
+    import io
+    import zipfile
+
+    monkeypatch.setenv("SW2ROBOT_VALIDATE_CMD",
+                       'validator --pkg "{output_path}" --report "{report_path}"')
+
+    class CP:
+        returncode = 0
+        stdout = '{"issues":[{"code":"mesh_origin"}]}'
+        stderr = "ok"
+
+    monkeypatch.setattr(
+        "sw2robot.exporter.export_validation.subprocess.run",
+        lambda *args, **kwargs: CP())
+
+    code, data = _get_status(server, "/api/export/zip?ros=1&meshes=dae")
+    assert code == 200, data[:200]
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    names = zf.namelist()
+    report_name = next(n for n in names if n.endswith("/_sw2robot_export.json"))
+    validation_name = next(
+        n for n in names if n.endswith("/_sw2robot_validation.json"))
+    report = json.loads(zf.read(report_name).decode("utf-8"))
+    validation = json.loads(zf.read(validation_name).decode("utf-8"))
+
+    assert validation["status"] == "ok"
+    assert report["validation"]["result"]["issues"][0]["code"] == "mesh_origin"
+
+
+def test_export_zip_mujoco_package(server):
+    """The web export can emit a MuJoCo-oriented package through the shared
+    async/sync ZIP pipeline."""
+    import io
+    import zipfile
+
+    code, data = _get_status(server, "/api/export/zip?target=mujoco&collision=hull")
+    assert code == 200, data[:200]
+    zf = zipfile.ZipFile(io.BytesIO(data))
+    names = zf.namelist()
+    assert any(n.endswith("_mujoco/urdf/fingertip.urdf") for n in names), names
+    report_name = next(n for n in names if n.endswith("/_sw2robot_export.json"))
+    report = json.loads(zf.read(report_name).decode("utf-8"))
+    urdf_name = next(n for n in names if n.endswith("/urdf/fingertip.urdf"))
+    urdf = zf.read(urdf_name).decode("utf-8")
+
+    assert report["backend"] == "mujoco_urdf"
+    assert report["backend_options"]["collision"] == "hull"
+    assert "../meshes/" in urdf
+    assert "package://" not in urdf
+
+
 def test_export_materializes_overlay_then_restores(server):
     """The on-disk URDF stays pristine while serving live, but the export window
     temporarily materializes the overlay so the ROS exporter picks edits up."""

@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 
+from .backend import ExportContext
 from . import jointcfg
 from .mesh import (
     _SAVE_OPTS,
@@ -45,6 +46,17 @@ from .swcom import SW_DOC_PART, SolidWorks, as_iface, doc_type_for
 from .urdf_writer import write_ros_package, write_urdf
 
 GRAPH_FILE = "graph.json"
+
+
+def _validator_cmd(validate_cmd=None):
+    return validate_cmd or os.environ.get("SW2ROBOT_VALIDATE_CMD") or None
+
+
+def _maybe_validate_export(result, ctx, validate_cmd):
+    if not validate_cmd:
+        return None
+    from .export_validation import run_external_validator
+    return run_external_validator(validate_cmd, result, ctx)
 
 
 def _tolerant_console():
@@ -236,8 +248,13 @@ def _loop_closures_cfg(model, joint_overrides):
 def build(pkg_dir, config_path=None, base_hint=None, exclude=None,
           ros_pkg=False, density=None, ros_version=1, ros_pkg_name=None,
           ros_urdf_name=None, collision="copy", coacd_quality="balanced",
-          merge_fixed=False, ros_mesh_dir=None):
+          merge_fixed=False, ros_mesh_dir=None, mujoco_pkg=False,
+          mujoco_pkg_name=None, mujoco_urdf_name=None,
+          mujoco_collision="auto", mujoco_coacd_quality="balanced",
+          mujoco_merge_fixed=True, mujoco_zero_origins=True,
+          validate_cmd=None):
     _tolerant_console()
+    validate_cmd = _validator_cmd(validate_cmd)
     graph = GraphState.load(os.path.join(pkg_dir, GRAPH_FILE))
     robot_name = graph.robot_name
     urdf_path = os.path.join(pkg_dir, "urdf", robot_name + ".urdf")
@@ -299,26 +316,65 @@ def build(pkg_dir, config_path=None, base_hint=None, exclude=None,
         os.remove(mside)
 
     desc_dir = None
+    desc_report = None
+    mujoco_dir = None
+    mujoco_report = None
     if ros_pkg:
-        # a standalone package next to pkg_dir (default <robot_name>_description,
-        # or --ros-pkg-name): package:// URLs + COLLADA .dae meshes
-        # (RViz/Gazebo-ready).  ros_version 2 also bundles launch/ + rviz/.
-        from .ros_export import write_ros_description_package
-        # per-link colour overrides (joints.yaml `colors:`) repaint <visual>
-        # meshes in the exported package
+        # A standalone backend export next to pkg_dir (default
+        # <robot_name>_description): package:// URLs + converted meshes
+        # (RViz/Gazebo-ready). ROS 2 also bundles launch/ + rviz/.
+        from .ros_export import RosDescriptionBackend
         colors = config.get("colors") if isinstance(config, dict) else None
-        desc_dir = write_ros_description_package(
-            pkg_dir, robot_name, os.path.dirname(os.path.abspath(pkg_dir)),
+        backend = RosDescriptionBackend(
             ros_version=ros_version, pkg_name=ros_pkg_name,
-            urdf_name=ros_urdf_name, colors=colors,
-            collision=collision, coacd_quality=coacd_quality,
-            merge_fixed=merge_fixed, mesh_dir=ros_mesh_dir,
-            loop_closures=closures)
+            urdf_name=ros_urdf_name, colors=colors, collision=collision,
+            coacd_quality=coacd_quality, merge_fixed=merge_fixed,
+            mesh_dir=ros_mesh_dir)
+        export_ctx = ExportContext(
+            pkg_dir=pkg_dir, robot_name=robot_name, urdf_path=urdf_path,
+            graph=graph, model=model,
+            sidecars={"loop_closures": closures,
+                      "mass_only_links": sorted(mass_only_links)})
+        result = backend.export(export_ctx)
+        desc_dir = result.output_path
+        desc_report = getattr(result, "artifacts", {}).get("report_path")
+        _maybe_validate_export(result, export_ctx, validate_cmd)
+    if mujoco_pkg:
+        from .mujoco_export import MujocoBackend
+        backend = MujocoBackend(
+            package_name=mujoco_pkg_name, urdf_name=mujoco_urdf_name,
+            collision=mujoco_collision,
+            coacd_quality=mujoco_coacd_quality,
+            merge_fixed=mujoco_merge_fixed,
+            zero_origins=mujoco_zero_origins)
+        export_ctx = ExportContext(
+            pkg_dir=pkg_dir, robot_name=robot_name, urdf_path=urdf_path,
+            graph=graph, model=model,
+            sidecars={"loop_closures": closures,
+                      "mass_only_links": sorted(mass_only_links)})
+        result = backend.export(export_ctx)
+        mujoco_dir = result.output_path
+        mujoco_report = getattr(result, "artifacts", {}).get("report_path")
+        _maybe_validate_export(result, export_ctx, validate_cmd)
 
     print(f"\nDONE. Package: {pkg_dir}")
     print(f"  URDF:   {urdf_path}")
     if desc_dir:
         print(f"  ROS pkg: {desc_dir}  (ROS {ros_version}, package:// + .dae)")
+        if desc_report:
+            print(f"  ROS report: {desc_report}")
+        if validate_cmd and getattr(result, "artifacts", {}).get(
+                "validation_report_path"):
+            print("  ROS validation: " +
+                  result.artifacts["validation_report_path"])
+    if mujoco_dir:
+        print(f"  MuJoCo pkg: {mujoco_dir}  (URDF + MuJoCo-ready meshes)")
+        if mujoco_report:
+            print(f"  MuJoCo report: {mujoco_report}")
+        if validate_cmd and getattr(result, "artifacts", {}).get(
+                "validation_report_path"):
+            print("  MuJoCo validation: " +
+                  result.artifacts["validation_report_path"])
     if not config_path:
         print(f"  Config: {tmpl}  (edit, re-run: "
               "python -m sw2robot.exporter.build with --config)")
@@ -331,13 +387,23 @@ def export(assembly_path, out_dir=None, robot_name=None, visible=False,
            config_path=None, base_hint=None, exclude=None, ros_pkg=False,
            ros_version=1, ros_pkg_name=None, ros_urdf_name=None,
            collision="copy", coacd_quality="balanced", merge_fixed=False,
-           ros_mesh_dir=None):
+           ros_mesh_dir=None, mujoco_pkg=False, mujoco_pkg_name=None,
+           mujoco_urdf_name=None, mujoco_collision="auto",
+           mujoco_coacd_quality="balanced", mujoco_merge_fixed=True,
+           mujoco_zero_origins=True, validate_cmd=None):
     pkg_dir = extract(assembly_path, out_dir, robot_name, visible)
     return build(pkg_dir, config_path=config_path, base_hint=base_hint,
                  exclude=exclude, ros_pkg=ros_pkg, ros_version=ros_version,
                  ros_pkg_name=ros_pkg_name, ros_urdf_name=ros_urdf_name,
                  collision=collision, coacd_quality=coacd_quality,
-                 merge_fixed=merge_fixed, ros_mesh_dir=ros_mesh_dir)
+                 merge_fixed=merge_fixed, ros_mesh_dir=ros_mesh_dir,
+                 mujoco_pkg=mujoco_pkg, mujoco_pkg_name=mujoco_pkg_name,
+                 mujoco_urdf_name=mujoco_urdf_name,
+                 mujoco_collision=mujoco_collision,
+                 mujoco_coacd_quality=mujoco_coacd_quality,
+                 mujoco_merge_fixed=mujoco_merge_fixed,
+                 mujoco_zero_origins=mujoco_zero_origins,
+                 validate_cmd=validate_cmd)
 
 
 def _exclude_list(s):
@@ -395,6 +461,39 @@ def main():
                     help="lump fixed-joint child links (with geometry) into "
                          "their parents in the --ros-pkg URDF -- one rigid link "
                          "per moving body; mesh-less coordinate frames are kept")
+    ap.add_argument("--mujoco-pkg", action="store_true",
+                    help="also write a MuJoCo-oriented package next to the "
+                         "working output (URDF + relative STL meshes, fixed "
+                         "links merged and origins baked by default)")
+    ap.add_argument("--mujoco-pkg-name", default=None,
+                    help="directory name for the --mujoco-pkg output "
+                         "(default: <name>_mujoco)")
+    ap.add_argument("--mujoco-urdf-name", default=None,
+                    help="stem for the URDF file inside the --mujoco-pkg "
+                         "output (default: the robot name)")
+    ap.add_argument("--mujoco-collision",
+                    choices=("auto", "copy", "hull", "coacd",
+                             "primitive", "box", "cylinder", "sphere"),
+                    default="auto",
+                    help="--mujoco-pkg collision geometry: 'auto' (default) "
+                         "prefers CoACD when available, else hull; the other "
+                         "modes mirror --collision")
+    ap.add_argument("--mujoco-coacd-quality", choices=("balanced", "fine"),
+                    default="balanced",
+                    help="CoACD preset for --mujoco-collision coacd")
+    ap.add_argument("--mujoco-keep-origins", action="store_true",
+                    help="keep visual/collision origins in the --mujoco-pkg "
+                         "URDF instead of baking them into mesh vertices")
+    ap.add_argument("--mujoco-no-merge-fixed", action="store_true",
+                    help="keep fixed joints in the --mujoco-pkg export instead "
+                         "of merging rigid children into their parents")
+    ap.add_argument("--validate-cmd", default=None,
+                    help="optional post-export validator command template; "
+                         "placeholders: {backend}, {output_path}, "
+                         "{package_dir}, {source_pkg_dir}, {robot_name}, "
+                         "{urdf_path}, {report_path}, "
+                         "{validation_report_path}. Defaults to env "
+                         "SW2ROBOT_VALIDATE_CMD when unset")
     args = ap.parse_args()
     export(args.assembly, args.out, args.name, args.visible,
            config_path=args.config, base_hint=args.base,
@@ -403,7 +502,15 @@ def main():
            ros_version=2 if args.ros2 else 1,
            ros_pkg_name=args.ros_pkg_name, ros_urdf_name=args.ros_urdf_name,
            collision=args.collision, coacd_quality=args.coacd_quality,
-           merge_fixed=args.merge_fixed, ros_mesh_dir=args.ros_mesh_dir)
+           merge_fixed=args.merge_fixed, ros_mesh_dir=args.ros_mesh_dir,
+           mujoco_pkg=args.mujoco_pkg,
+           mujoco_pkg_name=args.mujoco_pkg_name,
+           mujoco_urdf_name=args.mujoco_urdf_name,
+           mujoco_collision=args.mujoco_collision,
+           mujoco_coacd_quality=args.mujoco_coacd_quality,
+           mujoco_merge_fixed=not args.mujoco_no_merge_fixed,
+           mujoco_zero_origins=not args.mujoco_keep_origins,
+           validate_cmd=args.validate_cmd)
 
 
 if __name__ == "__main__":

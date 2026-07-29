@@ -621,7 +621,7 @@ def _export_zip(pkg_dir, robot_name, visual_fmt="dae", collision_fmt="stl",
                 ros_version=1, pkg_name=None, urdf_name=None, colors=None,
                 collision="copy", coacd_quality="balanced",
                 merge_fixed=False, mesh_dir=None, progress=None,
-                should_cancel=None):
+                should_cancel=None, target="ros", zero_origins=True):
     """ZIP a portable ROS package (package:// URLs), named ``pkg_name`` if given
     else ``<robot_name>_description``; the URDF inside is named ``urdf_name`` if
     given, else the package name.
@@ -644,25 +644,77 @@ def _export_zip(pkg_dir, robot_name, visual_fmt="dae", collision_fmt="stl",
     import io as _io
     import zipfile
 
+    from sw2robot.exporter.backend import ExportContext
+    from sw2robot.exporter.export_validation import run_external_validator
+    from sw2robot.exporter.mujoco_export import MujocoBackend
     from sw2robot.exporter.ros_export import (
-        ExportCancelled,
-        build_ros_description,
+        RosDescriptionBackend,
         ros_pkg_name,
     )
-    pkg = ros_pkg_name(robot_name, pkg_name)
-    ctx_fmt = (("visual", visual_fmt), ("collision", collision_fmt))
-    files = build_ros_description(pkg_dir, robot_name,
-                                  ros_version=ros_version,
-                                  pkg_name=pkg,
-                                  urdf_name=urdf_name,
-                                  colors=colors,
-                                  collision=collision,
-                                  coacd_quality=coacd_quality,
-                                  merge_fixed=merge_fixed,
-                                  mesh_dir=mesh_dir,
-                                  ctx_fmt=ctx_fmt,
-                                  progress=progress,
-                                  should_cancel=should_cancel)
+    from sw2robot.exporter.urdf_common import ExportCancelled
+
+    def _validator_cmd():
+        return os.environ.get("SW2ROBOT_VALIDATE_CMD") or None
+
+    def _zip_tree(root_dir, pkg_name_out):
+        out = []
+        pkg_root = os.path.join(root_dir, pkg_name_out)
+        paths = []
+        for dirpath, _dirnames, filenames in os.walk(pkg_root):
+            for fn in filenames:
+                paths.append(os.path.join(dirpath, fn))
+        paths.sort()
+        for full in paths:
+            rel = os.path.relpath(full, root_dir).replace("\\", "/")
+            with open(full, "rb") as f:
+                out.append((rel, f.read()))
+        return out
+
+    with tempfile.TemporaryDirectory(prefix="sw2robot_export_") as tmp:
+        ctx = ExportContext(
+            pkg_dir=pkg_dir,
+            robot_name=robot_name,
+            urdf_path=os.path.join(pkg_dir, "urdf", robot_name + ".urdf"),
+            sidecars={
+                "_export_progress": progress,
+                "_export_should_cancel": should_cancel,
+            })
+        if target == "mujoco":
+            backend = MujocoBackend(
+                package_name=pkg_name,
+                urdf_name=urdf_name,
+                collision=collision,
+                coacd_quality=coacd_quality,
+                merge_fixed=merge_fixed,
+                zero_origins=zero_origins,
+                export_surface="webserver_zip",
+                dest_dir=tmp)
+        else:
+            pkg_name = ros_pkg_name(robot_name, pkg_name)
+            ctx_fmt = (("visual", visual_fmt), ("collision", collision_fmt))
+            backend = RosDescriptionBackend(
+                ros_version=ros_version,
+                pkg_name=pkg_name,
+                urdf_name=urdf_name,
+                colors=colors,
+                collision=collision,
+                coacd_quality=coacd_quality,
+                merge_fixed=merge_fixed,
+                mesh_dir=mesh_dir,
+                ctx_fmt=ctx_fmt,
+                export_surface="webserver_zip",
+                dest_dir=tmp)
+        result = backend.export(ctx)
+        validate_cmd = _validator_cmd()
+        if validate_cmd:
+            if progress:
+                progress("validate", 0, 1)
+            run_external_validator(validate_cmd, result, ctx)
+            if progress:
+                progress("validate", 1, 1)
+        pkg = os.path.basename(os.path.abspath(result.output_path))
+        files = _zip_tree(tmp, pkg)
+
     buf = _io.BytesIO()
     n = len(files)
     if progress:
@@ -689,12 +741,19 @@ def _export_zip(pkg_dir, robot_name, visual_fmt="dae", collision_fmt="stl",
 
 
 # ---- async ZIP export (observable, one at a time) ---------------------------
+def _export_stages():
+    stages = ["collision", "convert meshes"]
+    if os.environ.get("SW2ROBOT_VALIDATE_CMD"):
+        stages.append("validate export")
+    stages.append("package + zip")
+    return stages
+
+
 # The sync /api/export/zip blocks the download with no feedback; CoACD-on-export
 # is minutes.  The editor instead starts /api/export/zip/start (a background job
 # reporting into _prog), watches /api/progress, then fetches the finished bytes
 # from /api/export/zip/download.  The sync endpoint stays for the launch_it.sh
 # curl one-liner, which needs a direct URL.
-_EXPORT_STAGES = ["collision", "convert meshes", "package + zip"]
 _export_out = {"data": None, "fname": None}
 _export_lock = threading.Lock()
 # cooperative cancel for the async export (checked between links/meshes; CoACD
@@ -707,6 +766,9 @@ def _parse_export_query(cls, query):
     ``(kwargs_for__export_zip, None)`` or ``(None, (error_str, code))``."""
     if not cls.pkg_dir:
         return None, ("no package open", 400)
+    target = (query.get("target") or ["ros"])[0]
+    if target not in ("ros", "mujoco"):
+        return None, (f"unsupported export target: {target}", 400)
     visual_fmt = (query.get("meshes") or ["dae"])[0]
     if visual_fmt not in ("dae", "stl", "glb"):
         return None, (f"unsupported visual mesh format: {visual_fmt}", 400)
@@ -716,10 +778,16 @@ def _parse_export_query(cls, query):
     ros = (query.get("ros") or ["1"])[0]
     if ros not in ("1", "2"):
         return None, (f"unsupported ros version: {ros}", 400)
-    from sw2robot.exporter.ros_export import COLLISION_MODES
-    collision = (query.get("collision") or ["copy"])[0]
-    if collision not in COLLISION_MODES:
-        return None, (f"unsupported collision mode: {collision}", 400)
+    if target == "mujoco":
+        from sw2robot.exporter.mujoco_export import _VALID_COLLISION
+        collision = (query.get("collision") or ["auto"])[0]
+        if collision not in _VALID_COLLISION:
+            return None, (f"unsupported collision mode: {collision}", 400)
+    else:
+        from sw2robot.exporter.ros_export import COLLISION_MODES
+        collision = (query.get("collision") or ["copy"])[0]
+        if collision not in COLLISION_MODES:
+            return None, (f"unsupported collision mode: {collision}", 400)
     cquality = (query.get("cquality") or ["balanced"])[0]
     if cquality not in ("balanced", "fine"):
         return None, (f"unsupported collision quality: {cquality}", 400)
@@ -733,11 +801,20 @@ def _parse_export_query(cls, query):
         return None, ("export needs the standard <pkg>/urdf/<name>.urdf + "
                       "<pkg>/meshes/ layout; open the URDF from inside a "
                       "urdf/ folder", 400)
+    merge_q = (query.get("mergefixed") or [None])[0]
+    zero_q = (query.get("zeroorigins") or [None])[0]
     return {
-        "visual_fmt": visual_fmt, "collision_fmt": collision_fmt,
-        "ros_version": int(ros), "collision": collision,
+        "target": target,
+        "visual_fmt": visual_fmt,
+        "collision_fmt": collision_fmt,
+        "ros_version": int(ros),
+        "collision": collision,
         "coacd_quality": cquality,
-        "merge_fixed": (query.get("mergefixed") or ["0"])[0] == "1",
+        "merge_fixed": (
+            merge_q != "0" if target == "mujoco"
+            else merge_q == "1"),
+        "zero_origins": (
+            zero_q != "0" if target == "mujoco" else True),
         "pkg_name": (query.get("name") or [""])[0].strip() or None,
         "urdf_name": (query.get("urdf") or [""])[0].strip() or None,
         "mesh_dir": (query.get("meshdir") or [""])[0].strip() or None,
@@ -765,6 +842,8 @@ def _export_gate(cls, query):
 
 
 def _export_fname(robot_name, pkg, params):
+    if params.get("target") == "mujoco":
+        return f"{pkg}.zip"
     return (f"{robot_name}_glb.zip"
             if params["visual_fmt"] == "glb" and params["collision_fmt"] == "glb"
             else f"{pkg}.zip")
@@ -774,8 +853,9 @@ def _run_export(pkg_dir, robot_name, urdf_rel, params, gen):
     """Background ZIP export; stashes the bytes for /api/export/zip/download.
     ``gen`` is this job's progress generation: cancelling abandons in-flight
     CoACD parts, so their late progress reports must not touch a newer job."""
-    from sw2robot.exporter.ros_export import ExportCancelled
+    from sw2robot.exporter.urdf_common import ExportCancelled
     _stage_map = {"collision": "collision", "meshes": "convert meshes",
+                  "validate": "validate export",
                   "zip": "package + zip"}
 
     def _bp(stage, done, total, detail=""):
@@ -4569,7 +4649,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 gate = _export_gate(cls, query)
                 if gate:
                     return self._send_json(gate[0], gate[1])
-                gen = _prog_start("export", _EXPORT_STAGES)
+                gen = _prog_start("export", _export_stages())
                 if gen is None:
                     return self._send_json(
                         {"error": "a job is already running"}, 409)
